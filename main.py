@@ -1,21 +1,122 @@
 import os
 import asyncio
+from contextlib import asynccontextmanager
 import httpx
 import discord
 from discord.ext import commands
 from discord import app_commands
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse
 import uvicorn
 
-# --- CONFIGURATION (Set these in Render Environment Variables) ---
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-ANON_CHANNEL_ID = int(os.getenv("ANON_CHANNEL_ID", "0"))
+# --- CONFIGURATION (Read from Render Environment Variables) ---
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+RAW_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+# Fix capital 'Https://' if present
+DISCORD_WEBHOOK_URL = "https://" + RAW_WEBHOOK[8:] if RAW_WEBHOOK.lower().startswith("https://") else RAW_WEBHOOK
+ANON_CHANNEL_ID = int(os.getenv("ANON_CHANNEL_ID", "1569705078556983366").strip())
 PORT = int(os.getenv("PORT", 10000))
 
-# --- 1. FASTAPI WEB PORTAL (ASKfm Clone + Render Keep-Alive) ---
-app = FastAPI(title="Anonymous Q&A Portal")
+# --- 1. DISCORD BOT SETUP ---
+intents = discord.Intents.default()
+intents.message_content = True  # Make sure 'Message Content Intent' is ON in Discord Dev Portal!
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+class AnonQuestionModal(discord.ui.Modal, title="Ask Anonymously"):
+    question = discord.ui.TextInput(
+        label="Your Anonymous Question / Confession",
+        style=discord.TextStyle.paragraph,
+        placeholder="Type here... Nobody (not even admins) can see who sent this.",
+        required=True,
+        max_length=1800
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        clean_q = self.question.value.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+        embed = discord.Embed(
+            title="🕵️ Anonymous Question",
+            description=clean_q,
+            color=discord.Color.from_rgb(255, 75, 92)
+        )
+        embed.set_footer(text="Click 'Ask Anonymously' below or use /ask to send yours!")
+
+        target_channel = bot.get_channel(ANON_CHANNEL_ID) or interaction.channel
+        await target_channel.send(embed=embed, view=PersistentAskView())
+        await interaction.response.send_message("✅ Your message has been posted anonymously!", ephemeral=True)
+
+class PersistentAskView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Ask Anonymously", style=discord.ButtonStyle.danger, emoji="🕵️", custom_id="persistent_anon_ask_btn")
+    async def ask_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AnonQuestionModal())
+
+@bot.event
+async def on_ready():
+    bot.add_view(PersistentAskView())
+    await bot.tree.sync()
+    print(f"✅ DISCORD BOT ONLINE: Logged in as {bot.user} (ID: {bot.user.id})")
+
+@bot.tree.command(name="ask", description="Send a 100% anonymous question to the Q&A channel")
+async def ask_slash(interaction: discord.Interaction):
+    await interaction.response.send_modal(AnonQuestionModal())
+
+@bot.tree.command(name="spawn_panel", description="Post the sticky 'Ask Anonymously' button panel in this channel")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def spawn_panel(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📬 Anonymous Questions & Confessions",
+        description=(
+            "Want to ask something or share a thought without revealing your name?\n\n"
+            "• **Click the button below** to open a private pop-up window.\n"
+            "• **Type `/ask`** anywhere in the server.\n"
+            "• **Use our Web Portal:** https://askmon-anon.onrender.com\n"
+            "• **Or just type directly in this channel**—the bot will instantly delete your message and repost it anonymously!"
+        ),
+        color=discord.Color.from_rgb(255, 75, 92)
+    )
+    await interaction.channel.send(embed=embed, view=PersistentAskView())
+    await interaction.response.send_message("✅ Panel spawned!", ephemeral=True)
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or message.webhook_id:
+        return
+
+    if message.channel.id == ANON_CHANNEL_ID:
+        content = message.content.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+        try:
+            await message.delete()
+        except discord.DiscordException as e:
+            print(f"⚠️ Could not delete message: {e}")
+
+        if content:
+            embed = discord.Embed(
+                title="🕵️ Anonymous Question",
+                description=content,
+                color=discord.Color.from_rgb(255, 75, 92)
+            )
+            embed.set_footer(text="Click 'Ask Anonymously' below so your name never flashes on screen!")
+            await message.channel.send(embed=embed, view=PersistentAskView())
+
+    await bot.process_commands(message)
+
+
+# --- 2. FASTAPI LIFESPAN (Automatically starts Discord Bot under Uvicorn) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    bot_task = None
+    if DISCORD_BOT_TOKEN:
+        print("🚀 Starting Discord bot in background task...")
+        bot_task = asyncio.create_task(bot.start(DISCORD_BOT_TOKEN))
+    else:
+        print("⚠️ WARNING: DISCORD_BOT_TOKEN environment variable is not set in Render!")
+    yield
+    if bot_task:
+        await bot.close()
+
+app = FastAPI(title="AskMon Anonymous Portal", lifespan=lifespan)
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -53,13 +154,13 @@ HTML_PAGE = """
 </html>
 """
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def index():
     return HTML_PAGE.replace("{status_banner}", "")
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "bot_online": bot.is_ready()}
 
 @app.post("/ask", response_class=HTMLResponse)
 async def submit_question(question: str = Form(...)):
@@ -75,107 +176,12 @@ async def submit_question(question: str = Form(...)):
             }]
         }
         async with httpx.AsyncClient() as client:
-            await client.post(DISCORD_WEBHOOK_URL, json=payload)
+            resp = await client.post(DISCORD_WEBHOOK_URL, json=payload)
+            print(f"Webhook POST status: {resp.status_code}")
 
     banner = '<div class="success">✅ Sent anonymously to Discord!</div>'
     return HTML_PAGE.replace("{status_banner}", banner)
 
-
-# --- 2. DISCORD BOT (Modal + Slash Command + Channel Auto-Mask) ---
-intents = discord.Intents.default()
-intents.message_content = True  # Required for the auto-delete channel fallback
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-class AnonQuestionModal(discord.ui.Modal, title="Ask Anonymously"):
-    question = discord.ui.TextInput(
-        label="Your Anonymous Question / Confession",
-        style=discord.TextStyle.paragraph,
-        placeholder="Type here... Nobody (not even admins) can see who sent this.",
-        required=True,
-        max_length=1800
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        clean_q = self.question.value.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-        embed = discord.Embed(
-            title="🕵️ Anonymous Question",
-            description=clean_q,
-            color=discord.Color.from_rgb(255, 75, 92)
-        )
-        embed.set_footer(text="Click 'Ask Anonymously' below or use /ask to send yours!")
-
-        target_channel = bot.get_channel(ANON_CHANNEL_ID) or interaction.channel
-        await target_channel.send(embed=embed, view=PersistentAskView())
-        await interaction.response.send_message("✅ Your message has been posted anonymously!", ephemeral=True)
-
-class PersistentAskView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Ask Anonymously", style=discord.ButtonStyle.danger, emoji="🕵️", custom_id="persistent_anon_ask_btn")
-    async def ask_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AnonQuestionModal())
-
-@bot.event
-async def on_ready():
-    bot.add_view(PersistentAskView())
-    await bot.tree.sync()
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-
-@bot.tree.command(name="ask", description="Send a 100% anonymous question to the Q&A channel")
-async def ask_slash(interaction: discord.Interaction):
-    await interaction.response.send_modal(AnonQuestionModal())
-
-@bot.tree.command(name="spawn_panel", description="Post the sticky 'Ask Anonymously' button panel in this channel")
-@app_commands.checks.has_permissions(manage_channels=True)
-async def spawn_panel(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="📬 Anonymous Questions & Confessions",
-        description=(
-            "Want to ask something or share a thought without revealing your name?\n\n"
-            "• **Click the button below** to open a private pop-up window.\n"
-            "• **Type `/ask`** anywhere in the server.\n"
-            "• **Or just type directly in this channel**—the bot will instantly delete your message and repost it anonymously!"
-        ),
-        color=discord.Color.from_rgb(255, 75, 92)
-    )
-    await interaction.channel.send(embed=embed, view=PersistentAskView())
-    await interaction.response.send_message("Panel spawned!", ephemeral=True)
-
-@bot.event
-async def on_message(message: discord.Message):
-    # Ignore bots and webhooks so it doesn't loop
-    if message.author.bot or message.webhook_id:
-        return
-
-    # Auto-mask any message typed directly in the dedicated anonymous channel
-    if message.channel.id == ANON_CHANNEL_ID:
-        content = message.content.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-        try:
-            await message.delete()
-        except discord.DiscordException:
-            pass
-
-        if content:
-            embed = discord.Embed(
-                title="🕵️ Anonymous Question",
-                description=content,
-                color=discord.Color.from_rgb(255, 75, 92)
-            )
-            embed.set_footer(text="Pro-tip: Click the 'Ask Anonymously' button so your name never flashes on screen!")
-            await message.channel.send(embed=embed, view=PersistentAskView())
-
-    await bot.process_commands(message)
-
-# --- 3. CONCURRENT RUNNER FOR RENDER ---
-async def main():
-    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
-    server = uvicorn.Server(config)
-    
-    tasks = [server.serve()]
-    if DISCORD_BOT_TOKEN:
-        tasks.append(bot.start(DISCORD_BOT_TOKEN))
-    await asyncio.gather(*tasks)
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    
